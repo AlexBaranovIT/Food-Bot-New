@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 # Telegram Bot Setup
-TELEGRAM_TOKEN =  '7714115337:AAGsOmrMVFz1O-QVvs1zZrP5vzVETxVSVY8'
-DISCORD_TOKEN = 'MTMwODMzOTgyMDE4NzA5MDk0Ng.Gyc9dn.WlOCBgTbVF4IrUBKaUegJc8LCugsmTNYXN2w0I'
+TELEGRAM_TOKEN =  'token'
+DISCORD_TOKEN = 'token'
 telegram_bot = TelegramBot(token=TELEGRAM_TOKEN)
 telegram_dp = TelegramDispatcher()
 
@@ -28,8 +28,8 @@ intents.message_content = True
 discord_bot = commands.Bot(command_prefix="/", intents=intents)
 
 # Discord Server and Group IDs
-GUILD_ID = 1308402572385718302  # Replace with your server ID
-MAIN_GROUP_ID = 1311720270175670292  # Replace with your main Discord group ID
+GUILD_ID = id  # Replace with your server ID
+MAIN_GROUP_ID = id  # Replace with your main Discord group ID
 
 # Shared Data for Orders
 orders = {}  # Store order data with user_id as key
