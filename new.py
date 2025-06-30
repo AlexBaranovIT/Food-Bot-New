@@ -28,8 +28,8 @@ intents.message_content = True
 discord_bot = commands.Bot(command_prefix="/", intents=intents)
 
 # Discord Server and Group IDs
-GUILD_ID = 1308402572385718302  # Replace with your server ID
-MAIN_GROUP_ID = 1311720270175670292  # Replace with your main Discord group ID
+GUILD_ID = ID  # Replace with your server ID
+MAIN_GROUP_ID = ID  # Replace with your main Discord group ID
 
 # Shared Data for Orders
 orders = {}  # Store order data with user_id as key
