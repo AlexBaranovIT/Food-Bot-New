@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 # Telegram Bot Setup
-TELEGRAM_TOKEN =  '7802686523:AAFk_PQnKlP6KqeJFJPrRxWh-aOpsCbnJrw'
-DISCORD_TOKEN = 'MTMwODMzOTgyMDE4NzA5MDk0Ng.Gyc9dn.WlOCBgTbVF4IrUBKaUegJc8LCugsmTNYXN2w0I'
+TELEGRAM_TOKEN =  'TG_TOKEN'
+DISCORD_TOKEN = 'TOKEN'
 telegram_bot = TelegramBot(token=TELEGRAM_TOKEN)
 telegram_dp = TelegramDispatcher()
 
