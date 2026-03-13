@@ -1,929 +1,955 @@
 import asyncio
-from aiogram import Bot as TelegramBot, Dispatcher as TelegramDispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
-import discord
-from discord.ext import commands
-from discord.ui import Button, View
-import tempfile
-import os
-from aiogram.types import FSInputFile
 import logging
+import os
+import subprocess
+from datetime import datetime, timedelta
+from asyncio import Lock
+from typing import Optional, Dict, Any
+from html import escape as html_escape
+
+from dotenv import load_dotenv
+
+# Load .env reliably from the same folder as this script
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# =========================
+# CONFIG
+# =========================
+TELEGRAM_TOKEN = '8372551001:AAGOyrcgdFSSbMmi8-AoJgiHGTbW9Q8H8o0'
 
-# Telegram Bot Setup
-TELEGRAM_TOKEN =  'token'
-DISCORD_TOKEN = 'token'
-telegram_bot = TelegramBot(token=TELEGRAM_TOKEN)
-telegram_dp = TelegramDispatcher()
+MANAGER_GROUP_ID = -1003707325782
 
-# Discord Bot Setup  # Replace with your Discord bot token
-intents = discord.Intents.default()
-intents.messages = True
-intents.guilds = True
-intents.message_content = True
-discord_bot = commands.Bot(command_prefix="/", intents=intents)
+REQUIRE_MANAGER_ADMIN = True
+ALLOWED_MANAGER_IDS = set()
 
-# Discord Server and Group IDs
-GUILD_ID = id  # Replace with your server ID
-MAIN_GROUP_ID = id  # Replace with your main Discord group ID
+MIN_ORDER_AMOUNT = 40.0
 
-# Shared Data for Orders
-orders = {}  # Store order data with user_id as key
-order_mappings = {}  # Format: {telegram_user_id: discord_channel_id}
-paid_orders = []  # List to store paid order details
-total_earnings = 0  # Variable to track total earnings
-from asyncio import Lock
+# Support contact shown to customers (no links block, only this)
+SUPPORT_USERNAME = "@zeljkopfc"
+SUPPORT_LINK = f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
 
-# Dictionary to track user locks
-order_locks = {}
+# =========================
+# IMAGES
+# =========================
+BASE_DIR = os.path.dirname(__file__)
 
+IMAGES = {
+    "start":       os.path.join(BASE_DIR, "start.png"),
+    "food":        os.path.join(BASE_DIR, "food.jpg"),
+    "flight":      os.path.join(BASE_DIR, "flights.jpg"),
+    "booking":     os.path.join(BASE_DIR, "booking.jpg"),
+    "rent_a_car":  os.path.join(BASE_DIR, "rent_a_car.jpg"),
+    "other":       os.path.join(BASE_DIR, "other.png"),
+}
 
+CATEGORY_IMAGE = {
+    "Flight":    IMAGES["flight"],
+    "Booking":   IMAGES["booking"],
+    "Rent A Car": IMAGES["rent_a_car"],
+    "All Other": IMAGES["other"],
+}
+
+# =========================
+# NEW SERVICES (top-level)
+# =========================
+NEW_SERVICES = {
+    "✈️ Flight 50% Off": {
+        "category": "Flight",
+        "deal": "50% Off",
+        "min_required": True,
+        "intro_html": (
+            "✈️ <b>FLIGHT 50% OFF</b>\n\n"
+            "Please write the <b>total amount</b> of your order in USD.\n"
+            "Example: <code>180</code> or <code>$180.50</code>"
+        ),
+    },
+    "🏨 Booking 50% Off": {
+        "category": "Booking",
+        "deal": "50% Off",
+        "min_required": True,
+        "intro_html": (
+            "🏨 <b>BOOKING 50% OFF</b>\n\n"
+            "Please write the <b>total amount</b> of your order in USD.\n"
+            "Example: <code>180</code> or <code>$180.50</code>"
+        ),
+    },
+    "🚗 Rent A Car 50% Off": {
+        "category": "Rent A Car",
+        "deal": "50% Off",
+        "min_required": True,
+        "intro_html": (
+            "🚗 <b>RENT A CAR 50% OFF</b>\n\n"
+            "Please write the <b>total amount</b> of your order in USD.\n"
+            "Example: <code>180</code> or <code>$180.50</code>"
+        ),
+    },
+    "📦 All Other 50% Off": {
+        "category": "All Other",
+        "deal": "50% Off",
+        "min_required": False,  # no <150 reject here (as requested)
+        "intro_html": (
+            "📦 <b>ALL OTHER 50% OFF</b>\n\n"
+            "Please write the <b>total amount</b> of your order in USD.\n"
+            "Example: <code>180</code> or <code>$180.50</code>"
+        ),
+    },
+}
+
+# =========================
+# BOT SETUP
+# =========================
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
+# =========================
+# STATE / STORAGE (in-memory)
+# =========================
+orders: Dict[int, Dict[str, Any]] = {}  # {customer_id: order_data}
+order_locks: Dict[int, Lock] = {}       # {customer_id: Lock()}
+
+order_assignments: Dict[int, int] = {}        # {customer_id: manager_user_id}
+manager_active_customer: Dict[int, int] = {}  # {manager_user_id: customer_id}
+
+# Map manager-group messages posted by bot -> customer_id (internal only)
+group_message_to_customer: Dict[int, int] = {}
+
+# Paid orders + earnings (group-visible summaries will not include any customer identifiers)
+paid_orders = []  # [{"customer_id":..., "manager_id":..., "amount":..., "date":..., "order_details":...}]
+total_earnings = 0.0
+
+# Food services availability
+service_availability = {
+    "Food 50% Off": True,
+}
+
+# =========================
+# HELPERS
+# =========================
 def build_inline_keyboard(options, back_callback=None):
     buttons = [[InlineKeyboardButton(text=option, callback_data=option)] for option in options]
     if back_callback:
         buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def manager_actions_keyboard(customer_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Accept Order", callback_data=f"accept:{customer_id}"),
+                InlineKeyboardButton(text="🚫 Unclaim", callback_data=f"unclaim:{customer_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="💵 Mark Paid", callback_data=f"paid_prompt:{customer_id}"),
+            ],
+        ]
+    )
 
-import subprocess
-import os
-from aiogram.types import FSInputFile
+async def is_manager_allowed(user: types.User, chat_id: int) -> bool:
+    if user is None:
+        return False
 
-@telegram_dp.message(Command("start"))
-async def start_command(message: types.Message):
-    user_id = message.from_user.id
-    orders[user_id] = {"step": "start"}  # Initialize user data
+    if ALLOWED_MANAGER_IDS and user.id not in ALLOWED_MANAGER_IDS:
+        return False
 
-    # Path to the original and re-encoded GIF files
-    original_gif_path = "TV1.gif"
-    reencoded_gif_path = "output.gif"
+    if not REQUIRE_MANAGER_ADMIN:
+        return True
 
-    # Check if the re-encoded GIF already exists
-    if not os.path.exists(reencoded_gif_path):
-        # If not, check if the original GIF exists and re-encode it
-        if os.path.exists(original_gif_path):
-            try:
-                # Re-encode the GIF using ffmpeg
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-i", original_gif_path,
-                        "-vf", "fps=15,scale=320:-1:flags=lanczos",
-                        reencoded_gif_path
-                    ],
-                    check=True  # Raise an error if the command fails
-                )
-                print("GIF re-encoded successfully.")
-            except subprocess.CalledProcessError as e:
-                # Handle ffmpeg errors
-                await message.answer("Failed to process the GIF. Please try again later.")
-                print(f"FFmpeg error: {e}")
-                return
-            except Exception as e:
-                # Handle other errors
-                await message.answer("There was an error processing the GIF. Please try again later.")
-                print(f"Error processing GIF: {e}")
-                return
-        else:
-            # Handle the case where the original GIF file does not exist
-            await message.answer("The animation file could not be found. Please contact support.")
-            return
-
-    # Wrap the re-encoded GIF file in FSInputFile
-    gif_file = FSInputFile(reencoded_gif_path)
-
-    # Send the re-encoded GIF as an animation
     try:
-        await telegram_bot.send_animation(
-            chat_id=message.chat.id,
-            animation=gif_file
+        member = await bot.get_chat_member(chat_id, user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+async def is_any_service_available() -> bool:
+    return any(service_availability.values())
+
+def parse_amount(text: str) -> Optional[float]:
+    if not text:
+        return None
+    t = text.strip().replace(",", ".")
+    cleaned = "".join(ch for ch in t if (ch.isdigit() or ch == "."))
+    if not cleaned or cleaned == ".":
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+def build_order_summary(order: Dict[str, Any]) -> str:
+    """
+    No customer identifiers, no usernames.
+    """
+    lines = ["🧾 <b>New Order Received</b>\n"]
+    lines.append(f"<b>Service:</b> {html_escape(str(order.get('service', 'N/A')))}")
+
+    # New-services fields
+    if order.get("category"):
+        lines.append(f"<b>Category:</b> {html_escape(str(order.get('category')))}")
+    if order.get("deal"):
+        lines.append(f"<b>Deal:</b> {html_escape(str(order.get('deal')))}")
+    if order.get("amount") is not None:
+        lines.append(f"<b>Total amount:</b> <b>${html_escape(str(order.get('amount')))}</b>")
+    if order.get("company_link"):
+        lines.append(f"<b>Company link:</b> {html_escape(str(order.get('company_link')))}")
+    if order.get("details_text"):
+        lines.append(f"<b>Details:</b>\n{html_escape(str(order.get('details_text')))}")
+
+    # Food fields
+    if order.get("restaurant"):
+        lines.append(f"<b>Restaurant:</b> {html_escape(str(order.get('restaurant')))}")
+    addr = order.get("pickup_address") or order.get("address")
+    if addr:
+        lines.append(f"<b>Address:</b> {html_escape(str(addr))}")
+    if order.get("phone"):
+        lines.append(f"<b>Phone:</b> {html_escape(str(order.get('phone')))}")
+    if order.get("name"):
+        lines.append(f"<b>Name:</b> {html_escape(str(order.get('name')))}")
+    if order.get("instructions"):
+        lines.append(f"<b>Instructions:</b> {html_escape(str(order.get('instructions')))}")
+    if order.get("tip"):
+        lines.append(f"<b>Tip:</b> {html_escape(str(order.get('tip')))}")
+
+    return "\n".join(lines) + "\n"
+
+async def forward_customer_message_to_group(customer_id: int, message: types.Message):
+    """
+    Customer -> group, without customer username/name/id visible.
+    """
+    header = "💬 <b>Message from customer</b>\n"
+
+    try:
+        if message.text:
+            sent = await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                text=header + "\n<b>Text:</b>\n" + html_escape(message.text),
+                parse_mode="HTML",
+            )
+            group_message_to_customer[sent.message_id] = customer_id
+
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            caption = header
+            if message.caption:
+                caption += "\n<b>Caption:</b>\n" + html_escape(message.caption)
+
+            sent = await bot.send_photo(
+                chat_id=MANAGER_GROUP_ID,
+                photo=file_id,
+                caption=caption,
+                parse_mode="HTML",
+            )
+            group_message_to_customer[sent.message_id] = customer_id
+
+        if message.document:
+            file_id = message.document.file_id
+            caption = header
+            if message.caption:
+                caption += "\n<b>Caption:</b>\n" + html_escape(message.caption)
+
+            sent = await bot.send_document(
+                chat_id=MANAGER_GROUP_ID,
+                document=file_id,
+                caption=caption,
+                parse_mode="HTML",
+            )
+            group_message_to_customer[sent.message_id] = customer_id
+
+    except Exception as e:
+        logger.exception(f"Failed to forward customer message to group: {e}")
+
+async def forward_manager_reply_to_customer(customer_id: int, message: types.Message):
+    """
+    Group(manager) -> customer, without manager username/name/id visible.
+    """
+    prefix = "👤 Support:\n"
+
+    try:
+        if message.text:
+            await bot.send_message(chat_id=customer_id, text=prefix + message.text)
+
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            caption = prefix + (message.caption or "")
+            await bot.send_photo(chat_id=customer_id, photo=file_id, caption=caption)
+
+        if message.document:
+            file_id = message.document.file_id
+            caption = prefix + (message.caption or "")
+            await bot.send_document(chat_id=customer_id, document=file_id, caption=caption)
+
+    except Exception as e:
+        logger.exception(f"Failed to forward manager reply to customer: {e}")
+
+async def post_order_to_manager_group(customer_id: int):
+    """
+    Post order summary + optional screenshot to manager group.
+    No customer identifiers in text/captions.
+    """
+    order = orders.get(customer_id, {})
+    if not order:
+        return
+
+    order["customer_id"] = customer_id  # internal only
+    text = build_order_summary(order)
+
+    try:
+        summary_msg = await bot.send_message(
+            chat_id=MANAGER_GROUP_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=manager_actions_keyboard(customer_id),
+        )
+        group_message_to_customer[summary_msg.message_id] = customer_id
+
+        # Screenshot path (food + new services)
+        screenshot_path = order.get("screenshot") or order.get("newsvc_screenshot")
+
+        if screenshot_path and os.path.exists(screenshot_path):
+            photo = FSInputFile(screenshot_path)
+            shot_msg = await bot.send_photo(
+                chat_id=MANAGER_GROUP_ID,
+                photo=photo,
+                caption="📸 <b>Order screenshot</b>",
+                parse_mode="HTML",
+            )
+            group_message_to_customer[shot_msg.message_id] = customer_id
+
+        await bot.send_message(
+            chat_id=customer_id,
+            text="✅ Received. Support will join the chat shortly.",
         )
     except Exception as e:
-        # Handle any errors in sending the animation
-        await message.answer("There was an error sending the animation. Please try again later.")
-        print(f"Error sending animation: {e}")
+        logger.exception(f"Error posting order to manager group: {e}")
+        await bot.send_message(chat_id=customer_id, text="❌ There was a problem submitting your order. Please try again later.")
 
-    # Send the welcome message with formatting
-    await message.answer(
-        """<b><u>Welcome to Eatery!</u></b>
+async def send_section_photo(chat_id: int, image_key: str, caption: str, parse_mode: str = "HTML", reply_markup=None):
+    """Send a section image with caption and optional keyboard."""
+    image_path = IMAGES.get(image_key)
+    if image_path and os.path.exists(image_path):
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=FSInputFile(image_path),
+            caption=caption,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
 
-Don't miss out on our amazing deals up to <b><u>50% OFF!</u></b>
+# =========================
+# CUSTOMER FLOW: START + TOP MENU
+# =========================
+@dp.callback_query(F.data == "start")
+async def back_to_start(callback_query: types.CallbackQuery):
+    await start_command(callback_query.message)
+    await callback_query.answer()
 
-<b>Our links:</b>
-<a href="https://t.me/EateryB4U">https://t.me/EateryB4U</a>
-<a href="https://t.me/EateryVouches">https://t.me/EateryVouches</a>
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    user_id = message.from_user.id
+    orders[user_id] = {"step": "start"}
 
-Click on a service below to start the order process.
-
-<b>Need help?</b> Contact <a href="https://t.me/Eatery_Support">@Eatery_Support</a>
-""",
-        parse_mode="HTML",  # Enable HTML formatting
-        reply_markup=build_inline_keyboard(["🍟 Food"])
+    welcome_text = (
+        f"<b><u>Welcome!</u></b>\n\n"
+        f"We offer up to <b><u>50% OFF</u></b> on selected services.\n\n"
+        f"Choose a service below to begin.\n\n"
+        f"<b>Need help?</b> Contact <a href=\"{SUPPORT_LINK}\">{html_escape(SUPPORT_USERNAME)}</a>"
     )
 
+    keyboard = build_inline_keyboard(
+        [
+            "🍔 Food 50% Off",
+            "✈️ Flight 50% Off",
+            "🏨 Booking 50% Off",
+            "🚗 Rent A Car 50% Off",
+            "📦 All Other 50% Off",
+        ],
+        back_callback="start",
+    )
 
-@telegram_dp.callback_query(lambda c: c.data == "🍟 Food")
+    await send_section_photo(message.chat.id, "start", welcome_text, reply_markup=keyboard)
+
+# =========================
+# FOOD FLOW (original)
+# =========================
+@dp.callback_query(F.data == "🍔 Food 50% Off")
 async def food_menu(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
+    orders.setdefault(user_id, {})
 
-    # Ensure the user ID exists in the orders dictionary
-    if user_id not in orders:
-        orders[user_id] = {}  # Initialize user data if not present
+    if not service_availability.get("Food 50% Off", False):
+        await callback_query.message.answer(
+            "❌ Food service is currently CLOSED. Please try again later.",
+            reply_markup=build_inline_keyboard([], back_callback="start"),
+        )
+        await callback_query.answer()
+        return
 
-    orders[user_id]["step"] = "food"  # Update the step
+    orders[user_id].update({
+        "step": "food_amount",
+        "service": "Food 50% Off",
+        "submitted_to_group": False,
+    })
 
-    # Send the food menu to the user
-    await callback_query.message.edit_text(
-        "Select a service to continue:",
-        reply_markup=build_inline_keyboard(["🍜 DoorDash", "🍕 Uber Eats"], back_callback="start")
+    food_text = (
+        "🍔 <b>Chevy Food Services 50% Off</b>\n\n"
+        "If you are looking for food with a discount, you're in the right place.\n"
+        "Minimum order: $40\n\n"
+        "✅ <b>LIST OF RESTAURANTS</b> ✅\n"
+        "- WINGSTOP 🍗\n"
+        "- RAISING CANES 🐔\n"
+        "- CHIPOTLE 🌯\n"
+        "- FIVE GUYS 🍔\n"
+        "- TEXAS ROADHOUSE 🥩\n"
+        "- KFC 🍗\n"
+        "- OUTBACK 🥩\n"
+        "- PIZZA HUT 🍕\n"
+        "- APPLEBEE'S 🍔\n"
+        "- DOMINO'S 🍕\n"
+        "- PAPA JOHNS 🍕\n"
+        "- CHEESECAKE FACTORY 🍰\n"
+        "- CUSTOM\n"
+        "- MORE...\n\n"
+        "Enter your total order amount (USD):"
     )
+
+    keyboard = build_inline_keyboard([], back_callback="start")
+    await send_section_photo(callback_query.message.chat.id, "food", food_text, reply_markup=keyboard)
     await callback_query.answer()
 
-@telegram_dp.callback_query(lambda c: c.data == "🍜 DoorDash")
-async def doordash_menu(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    orders[user_id]["step"] = "doordash"
-    await callback_query.message.edit_text(
-        "Select a DoorDash service:",
-        reply_markup=build_inline_keyboard(["🟢 DoorDash Delivery", "🟢 DoorDash Pickup"], back_callback="🍟 Food")
-    )
-    await callback_query.answer()
-
-@telegram_dp.callback_query(lambda c: c.data == "🍕 Uber Eats")
-async def uber_eats_menu(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    orders[user_id]["step"] = "uber_eats"
-    await callback_query.message.edit_text(
-        "Select an Uber Eats service:",
-        reply_markup=build_inline_keyboard(["🟢 Uber Eats Delivery"], back_callback="🍟 Food")
-    )
-    await callback_query.answer()
-
-@telegram_dp.callback_query(lambda c: c.data == "🟢 DoorDash Delivery")
-async def doordash_delivery(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    orders[user_id]["step"] = "doordash_delivery"
-    orders[user_id]["service"] = "DoorDash Delivery"
-    await callback_query.message.edit_text(
-        """🍟DOORDASH DELIVERY 50% OFF!
-
-⚡️ $35 Subtotal Minimum
-⚡️ Delivery Only
-⚡️ Restaurants only!
-
-Please specify the restaurant name:""",
-        reply_markup=build_inline_keyboard([], back_callback="🍜 DoorDash")
-    )
-    await callback_query.answer()
-
-
-@telegram_dp.callback_query(lambda c: c.data == "🟢 DoorDash Pickup")
-async def doordash_pickup(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    orders[user_id] = {
-        "step": "doordash_pickup",
-        "service": "DoorDash Pickup"
-    }
-    await callback_query.message.edit_text(
-        """🍟DOORDASH PICKUP | 50% OFF!
-
-⚡️ $35 Subtotal Minimum
-⚡️ Pickup Only
-⚡️ Restaurants only!
-
-Please specify the restaurant name:""",
-        reply_markup=build_inline_keyboard([], back_callback="🍜 DoorDash")
-    )
-    await callback_query.answer()
-
-
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "doordash_pickup")
-async def handle_pickup_restaurant_name(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_amount")
+async def handle_food_amount(message: types.Message):
     user_id = message.from_user.id
+    amt = parse_amount(message.text or "")
+    if amt is None:
+        await message.answer("❌ Send amount like <code>180</code> or <code>$180.50</code>.", parse_mode="HTML")
+        return
 
-    # Store the restaurant name
-    orders[user_id]["restaurant"] = message.text
-    orders[user_id]["step"] = "pickup_address"  # Move to the next step
+    if amt < MIN_ORDER_AMOUNT:
+        orders[user_id]["step"] = "food_rejected"
+        await message.answer(
+            f"❌ We don't work with orders below <b>${MIN_ORDER_AMOUNT:.0f}</b>.\n"
+            f"Your amount: <b>${amt:.2f}</b>\n\n"
+            "Press /start to try again.",
+            parse_mode="HTML",
+        )
+        return
 
-    # Ask for the restaurant's full address
-    await message.answer("Send your FULL restaurant address including City and Zip Code.")
+    orders[user_id]["amount"] = round(amt, 2)
+    orders[user_id]["step"] = "food_restaurant"
+    await message.answer("Please specify the restaurant name:")
 
-
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "pickup_address")
-async def handle_pickup_address(message: types.Message):
-    user_id = message.from_user.id
-
-    # Store the restaurant address
-    orders[user_id]["pickup_address"] = message.text
-    orders[user_id]["step"] = "pickup_name"  # Move to the next step
-
-    # Ask for the customer's name
-    await message.answer("What is your name for this order?")
-
-
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "pickup_name")
-async def handle_pickup_name(message: types.Message):
-    user_id = message.from_user.id
-
-    # Store the customer's name
-    orders[user_id]["name"] = message.text
-    orders[user_id]["step"] = "pickup_screenshot"  # Move to the next step
-
-    # Ask for screenshots
-    await message.answer(
-        "Please provide us with a screenshot of your cart and a screenshot of the total INCLUDING taxes and fees!"
-    )
-
-
-@telegram_dp.callback_query(lambda c: c.data == "🟢 Uber Eats Delivery")
-async def uber_eats_delivery(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    orders[user_id]["step"] = "uber_eats_delivery"
-    orders[user_id]["service"] = "Uber Eats Delivery"
-    await callback_query.message.edit_text(
-        """🍟UBER EATS DELIVERY 50% OFF!
-
-⚡️ $35 Subtotal Minimum
-⚡️ Delivery Only
-⚡️ Restaurants only!
-
-Please specify the restaurant name:""",
-        reply_markup=build_inline_keyboard([], back_callback="🍕 Uber Eats")
-    )
-    await callback_query.answer()
-
-
-# Order Data Collection Handlers
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") in ["doordash_delivery", "uber_eats_delivery", "doordash_pickup"])
-async def handle_restaurant_name(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_restaurant")
+async def handle_food_restaurant(message: types.Message):
     user_id = message.from_user.id
     orders[user_id]["restaurant"] = message.text
-    next_step = "address" if orders[user_id]["step"] != "doordash_pickup" else "pickup_address"
-    orders[user_id]["step"] = next_step
-    await message.answer(
-        "Send your FULL address including City and Zip Code." if next_step == "address" else "Send the FULL restaurant address."
-    )
+    orders[user_id]["step"] = "food_address"
+    await message.answer("Send your FULL address including City and Zip Code.")
 
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "address")
-async def handle_address(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_address")
+async def handle_food_address(message: types.Message):
     user_id = message.from_user.id
     orders[user_id]["address"] = message.text
-    orders[user_id]["step"] = "phone"
+    orders[user_id]["step"] = "food_phone"
     await message.answer("What is your phone number?")
 
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "phone")
-async def handle_phone(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_phone")
+async def handle_food_phone(message: types.Message):
     user_id = message.from_user.id
     orders[user_id]["phone"] = message.text
-    orders[user_id]["step"] = "name"
+    orders[user_id]["step"] = "food_name"
     await message.answer("What is your name for this order?")
 
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "name")
-async def handle_name(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_name")
+async def handle_food_name(message: types.Message):
     user_id = message.from_user.id
     orders[user_id]["name"] = message.text
-    orders[user_id]["step"] = "instructions"
+    orders[user_id]["step"] = "food_instructions"
     await message.answer("Delivery Instructions? (if none, say N/A)")
 
-
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "instructions")
-async def handle_instructions(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_instructions")
+async def handle_food_instructions(message: types.Message):
     user_id = message.from_user.id
     orders[user_id]["instructions"] = message.text
-    orders[user_id]["step"] = "tip"
+    orders[user_id]["step"] = "food_tip"
     await message.answer("Do you want to include a tip for faster delivery? (yes/no or specify amount)")
 
-
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "tip")
-async def handle_tip(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_tip")
+async def handle_food_tip(message: types.Message):
     user_id = message.from_user.id
     orders[user_id]["tip"] = message.text
-    orders[user_id]["step"] = "screenshot"
+    orders[user_id]["step"] = "food_screenshot"
     await message.answer("Send a photo or screenshot of your full order.")
 
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "food_screenshot")
+async def handle_food_screenshot(message: types.Message):
+    customer_id = message.from_user.id
 
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "screenshot")
-async def handle_screenshot(message: types.Message):
-    user_id = message.from_user.id
+    if customer_id not in order_locks:
+        order_locks[customer_id] = Lock()
 
-    # Ensure a lock exists for this user
-    if user_id not in order_locks:
-        order_locks[user_id] = Lock()
-
-    async with order_locks[user_id]:
-        if orders.get(user_id, {}).get("sent_to_discord"):
-            await message.reply("Your order is already being processed. Please wait for admin response.")
+    async with order_locks[customer_id]:
+        if orders.get(customer_id, {}).get("submitted_to_group"):
+            await message.reply("Your order is already submitted. Please wait for support.")
             return
 
-        if message.photo:
-            try:
-                # Fetch the highest resolution of the photo
-                file_id = message.photo[-1].file_id  # This ensures we get the largest available resolution
-                file = await telegram_bot.get_file(file_id)
-
-                # Download the photo locally
-                local_file_path = f"delivery_screenshot_{user_id}.jpg"
-                await telegram_bot.download_file(file.file_path, destination=local_file_path)
-
-                # Save screenshot details and prevent duplicate sends
-                if "screenshot" in orders[user_id]:
-                    await message.reply("Screenshot already received. Please wait for processing.")
-                    return
-
-                orders[user_id]["screenshot"] = local_file_path
-                orders[user_id]["step"] = "completed"
-
-                # Notify the user
-                await message.reply("Thank you! Your order is being processed. Please wait while we assign an admin.")
-
-                # Forward the order to Discord
-                await forward_order_to_general_discord(user_id)
-            except Exception as e:
-                print(f"Error handling screenshot: {e}")
-                await message.reply("There was an issue processing your screenshot. Please try again.")
-        else:
-            await message.reply("Please send a valid screenshot to complete your order.")
-
-
-@telegram_dp.message(lambda message: orders.get(message.from_user.id, {}).get("step") == "pickup_screenshot")
-async def handle_pickup_screenshot(message: types.Message):
-    user_id = message.from_user.id
-
-    # Ensure a lock exists for this user
-    if user_id not in order_locks:
-        order_locks[user_id] = Lock()
-
-    async with order_locks[user_id]:
-        if orders.get(user_id, {}).get("sent_to_discord"):
-            await message.reply("Your order is already being processed. Please wait for admin response.")
+        if not message.photo:
+            await message.reply("Please send a valid screenshot/photo to complete your order.")
             return
 
-        if message.photo:
-            try:
-                # Fetch the highest resolution of the photo
-                file_id = message.photo[-1].file_id  # Ensures the largest available resolution
-                file = await telegram_bot.get_file(file_id)
+        try:
+            file_id = message.photo[-1].file_id
+            file = await bot.get_file(file_id)
 
-                # Download the photo locally
-                local_file_path = f"pickup_screenshot_{user_id}.jpg"
-                await telegram_bot.download_file(file.file_path, destination=local_file_path)
+            local_file_path = f"food_screenshot_{customer_id}.jpg"
+            await bot.download_file(file.file_path, destination=local_file_path)
 
-                # Save screenshot details in the orders dictionary
-                orders[user_id]["pickup_screenshot"] = local_file_path
-                orders[user_id]["step"] = "completed"
+            orders[customer_id]["screenshot"] = local_file_path
+            orders[customer_id]["step"] = "completed"
+            orders[customer_id]["submitted_to_group"] = True
 
-                # Notify the user
-                await message.reply("Thank you! Your order is being processed. Please wait while we assign an admin.")
+            await post_order_to_manager_group(customer_id)
 
-                # Forward the order to Discord
-                await forward_pickup_order_to_discord(user_id)
-            except Exception as e:
-                print(f"Error handling pickup screenshot: {e}")
-                await message.reply("There was an issue processing your screenshot. Please try again.")
-        else:
-            await message.reply("Please send a valid screenshot to complete your order.")
+        except Exception as e:
+            logger.exception(f"Error handling food screenshot: {e}")
+            await message.reply("There was an issue processing your screenshot. Please try again.")
 
+# =========================
+# NEW SERVICES FLOW
+# =========================
+@dp.callback_query(F.data.in_(set(NEW_SERVICES.keys())))
+async def new_service_entry(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    svc = NEW_SERVICES[callback_query.data]
 
-@telegram_dp.message(Command("ping"))
-async def telegram_ping(message: types.Message):
+    orders.setdefault(user_id, {})
+    orders[user_id].update({
+        "step": "new_amount",
+        "new_key": callback_query.data,
+        "category": svc["category"],
+        "deal": svc["deal"],
+        "service": f"{svc['category']} {svc['deal']}",
+        "amount": None,
+        "company_link": None,
+        "details_text": None,
+        "newsvc_screenshot": None,
+        "submitted_to_group": False,
+    })
+
+    image_path = CATEGORY_IMAGE.get(svc["category"])
+    image_key = next((k for k, v in IMAGES.items() if v == image_path), None)
+
+    keyboard = build_inline_keyboard([], back_callback="start")
+    await send_section_photo(
+        callback_query.message.chat.id,
+        image_key,
+        svc["intro_html"],
+        reply_markup=keyboard,
+    )
+    await callback_query.answer()
+
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "new_amount")
+async def new_handle_amount(message: types.Message):
     user_id = message.from_user.id
-
-    if user_id in orders and orders[user_id].get("step"):
-        if user_id in order_mappings:
-            # Get the corresponding Discord channel
-            channel_id = order_mappings[user_id]
-            channel = discord_bot.get_channel(channel_id)
-
-            if channel:
-                await channel.send(f"🔔 Ping from client @{message.from_user.username or 'Unknown'}!")
-                await message.answer("Ping sent to the admin.")
-            else:
-                await message.answer("Error: Could not find the Discord channel for your order.")
-        else:
-            await message.answer("Your order has not been assigned to an admin yet.")
-    else:
-        await message.answer("You do not have an active order.")
-
-
-@telegram_dp.message(Command("cancel"))
-async def cancel_order(message: types.Message):
-    user_id = message.from_user.id
-
-    # Check if the user has an active order
-    if user_id not in orders:
-        await message.reply("You don't have an active order to cancel.")
-        orders[user_id]["sent_to_discord"] = False
+    key = orders.get(user_id, {}).get("new_key")
+    svc = NEW_SERVICES.get(key)
+    if not svc:
+        await message.answer("❌ Session expired. Press /start.")
         return
 
-    # Get the associated Discord channel (if any)
-    discord_channel_id = order_mappings.get(user_id)
+    amt = parse_amount(message.text or "")
+    if amt is None:
+        await message.answer("❌ Send amount like <code>180</code> or <code>$180.50</code>.", parse_mode="HTML")
+        return
 
-    # Notify the admin (if the order is claimed)
-    if discord_channel_id:
-        channel = discord_bot.get_channel(discord_channel_id)
-        if channel:
-            try:
-                await channel.send(f"🔔 The client has canceled their order. Communication is now closed.")
-            except Exception as e:
-                print(f"Error notifying admin about cancellation: {e}")
+    orders[user_id]["amount"] = round(amt, 2)
 
-        # Remove the mapping to stop communication
-        del order_mappings[user_id]
+    if svc["min_required"] and amt < MIN_ORDER_AMOUNT:
+        orders[user_id]["step"] = "new_rejected"
+        await message.answer(
+            f"❌ We don't work with orders below <b>${MIN_ORDER_AMOUNT:.0f}</b>.\n"
+            f"Your amount: <b>${amt:.2f}</b>\n\n"
+            "Press /start to try again.",
+            parse_mode="HTML",
+        )
+        return
 
-    # Notify the client
-    await message.reply("Your order has been successfully canceled. Thank you for letting us know!")
+    orders[user_id]["step"] = "new_link"
+    await message.answer("Send the <b>company link</b> for this order (URL).", parse_mode="HTML")
 
-    # Clean up the order from the system
-    if user_id in orders:
-        del orders[user_id]
-
-    # Debugging/logging
-    print(f"Order for user {user_id} has been canceled.")
-
-
-@telegram_dp.message()
-async def forward_to_discord(message: types.Message):
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "new_link")
+async def new_handle_link(message: types.Message):
     user_id = message.from_user.id
+    link = (message.text or "").strip()
+    if not link or "http" not in link:
+        await message.answer("❌ Please send a valid link (must include http/https).")
+        return
 
-    # Check if the user has an active order
-    if user_id not in orders:
-        return  # Do nothing if the order is canceled or non-existent
+    orders[user_id]["company_link"] = link
+    orders[user_id]["step"] = "new_details"
+    await message.answer(
+        "Send <b>order details</b>:\n"
+        "• screenshot/photo OR\n"
+        "• text with all necessary information.",
+        parse_mode="HTML",
+    )
 
-    if user_id in order_mappings:
-        channel_id = order_mappings[user_id]
-        channel = discord_bot.get_channel(channel_id)
+@dp.message(lambda m: orders.get(m.from_user.id, {}).get("step") == "new_details")
+async def new_handle_details(message: types.Message):
+    customer_id = message.from_user.id
 
-        if channel:
-            # Forward text messages
-            if message.text:
-                await channel.send(f"Client: {message.text}")
-            elif message.photo:
+    if customer_id not in order_locks:
+        order_locks[customer_id] = Lock()
+
+    async with order_locks[customer_id]:
+        if orders.get(customer_id, {}).get("submitted_to_group"):
+            await message.answer("✅ Already submitted. Support will reply here.")
+            return
+
+        has_text = bool((message.text or "").strip() or (message.caption or "").strip())
+        has_photo = bool(message.photo)
+
+        if not has_text and not has_photo:
+            await message.answer("❌ Send either a screenshot/photo or text details.")
+            return
+
+        if (message.text or "").strip():
+            orders[customer_id]["details_text"] = message.text.strip()
+        elif (message.caption or "").strip():
+            orders[customer_id]["details_text"] = message.caption.strip()
+        else:
+            orders[customer_id]["details_text"] = ""
+
+        if has_photo:
+            try:
                 file_id = message.photo[-1].file_id
-                file = await telegram_bot.get_file(file_id)
-                local_file_path = f"client_photo_{user_id}.jpg"
-                await telegram_bot.download_file(file.file_path, destination=local_file_path)
-
-                with open(local_file_path, "rb") as photo:
-                    discord_file = discord.File(photo, filename="client_photo.jpg")
-                    await channel.send(content="Client sent a photo:", file=discord_file)
-            else:
-                await message.reply("Unsupported message type.")
-        else:
-            await message.reply("Error: Could not find the Discord channel for this order.")
-    else:
-        # Only reply if the user tries to communicate without an admin assigned
-        if orders.get(user_id, {}).get("sent_to_discord"):
-            await message.reply("Your order is already being processed. Please wait for admin response.")
-        else:
-            await message.reply("Your order has not been assigned to an admin yet.")
-
-
-@telegram_dp.message(Command("ping"))
-async def telegram_ping(message: types.Message):
-    user_id = message.from_user.id
-
-    if user_id in orders and orders[user_id].get("step"):
-        if user_id in order_mappings:
-            # Get the corresponding Discord channel
-            channel_id = order_mappings[user_id]
-            channel = discord_bot.get_channel(channel_id)
-
-            if channel:
-                await channel.send(f"🔔 Ping from client!")
-                await message.answer("Ping sent to the admin.")
-            else:
-                await message.answer("Error: Could not find the Discord channel for your order.")
-        else:
-            await message.answer("Your oxrder has not been assigned to an admin yet.")
-    else:
-        await message.answer("You do not have an active order.")
-
-
-ROLE_MAPPINGS = {
-    "DoorDash Delivery": "<@&1311601904110932010>",
-    "DoorDash Pickup": "<@&1311602128518909982>",
-    "Uber Eats Delivery": "<@&1311602034566238229>"
-}
-
-async def forward_order_to_general_discord(user_id):
-    # Check if the order has already been sent
-    if orders.get(user_id, {}).get("sent_to_discord"):
-        print(f"Order for user {user_id} has already been sent to Discord. Skipping duplicate.")
-        return
-
-    guild = discord_bot.get_guild(GUILD_ID)
-    main_group = guild.get_channel(MAIN_GROUP_ID) if guild else None
-
-    if guild and main_group:
-        order = orders.get(user_id, {})
-        role_mention = ROLE_MAPPINGS.get(order.get("service"), "")
-
-        # Construct the full order summary
-        order_summary = f"""
-        **New Order Received {role_mention}**
-
-        ```yaml
-        Service Type:         {order.get('service', 'N/A')}
-        Restaurant:           {order.get('restaurant', 'N/A')}
-        Full Address:         {order.get('address', 'N/A')}
-        Phone Number:         {order.get('phone', 'N/A')}
-        Customer Name:        {order.get('name', 'N/A')}
-        Instructions:         {order.get('instructions', 'N/A')}
-        Tip Amount:           {order.get('tip', 'N/A')}
-        ```
-        """
-
-        try:
-            # Send the order summary to the general channel
-            general_message = await main_group.send(content=order_summary)
-
-            # Send the order screenshot if available
-            screenshot_message = None
-            screenshot_path = order.get("screenshot")
-            if screenshot_path:
-                with open(screenshot_path, "rb") as screenshot_file:
-                    discord_file = discord.File(screenshot_file, filename="order_screenshot.jpg")
-                    screenshot_message = await main_group.send(content="**Order Screenshot:**", file=discord_file)
-
-            # Attach the "Accept Order" button to the summary message
-            view = GeneralOrderView(user_id, general_message, screenshot_message)
-            await general_message.edit(view=view)
-
-            # Mark the order as sent
-            orders[user_id]["sent_to_discord"] = True
-            print(f"Order for user {user_id} sent to the general channel successfully.")
-        except Exception as e:
-            print(f"Error sending order to general Discord channel: {e}")
-
-
-async def forward_pickup_order_to_discord(user_id):
-    # Check if the pickup order has already been sent
-    if orders.get(user_id, {}).get("sent_to_discord"):
-        print(f"Pickup order for user {user_id} has already been sent to Discord. Skipping duplicate.")
-        return
-
-    guild = discord_bot.get_guild(GUILD_ID)
-    main_group = guild.get_channel(MAIN_GROUP_ID) if guild else None
-
-    if guild and main_group:
-        order = orders.get(user_id, {})
-        role_mention = ROLE_MAPPINGS.get(order.get("service"), "")
-
-        # Construct the full order summary
-        order_summary = f"""
-        **New Pickup Order Received {role_mention}**
-
-        ```yaml
-        Service Type:         {order.get('service', 'N/A')}
-        Restaurant:           {order.get('restaurant', 'N/A')}
-        Full Address:         {order.get('pickup_address', 'N/A')}
-        Customer Name:        {order.get('name', 'N/A')}
-        ```
-        """
-
-        try:
-            # Send the order summary to the general channel
-            general_message = await main_group.send(content=order_summary)
-
-            # Send the pickup screenshot if available
-            screenshot_message = None
-            screenshot_path = order.get("pickup_screenshot")
-            if screenshot_path:
-                # Open and send the file without resizing
-                with open(screenshot_path, "rb") as screenshot_file:
-                    discord_file = discord.File(screenshot_file, filename="pickup_screenshot.jpg")
-                    screenshot_message = await main_group.send(content="**Pickup Order Screenshot:**", file=discord_file)
-
-            # Attach the "Accept Order" button to the summary message
-            view = GeneralOrderView(user_id, general_message, screenshot_message)
-            await general_message.edit(view=view)
-
-            # Mark the order as sent
-            orders[user_id]["sent_to_discord"] = True
-            print(f"Pickup order for user {user_id} sent to the general channel successfully.")
-        except Exception as e:
-            print(f"Error sending pickup order to general Discord channel: {e}")
-
-
-# Discord Handlers
-@discord_bot.command(name="ping")
-async def discord_ping(ctx):
-    for telegram_user_id, discord_channel_id in order_mappings.items():
-        if ctx.channel.id == discord_channel_id:
-            try:
-                await telegram_bot.send_message(chat_id=telegram_user_id, text="🔔 Ping from the admin!")
-                await ctx.send("Ping sent to the client.")
+                file = await bot.get_file(file_id)
+                local_file_path = f"newsvc_screenshot_{customer_id}.jpg"
+                await bot.download_file(file.file_path, destination=local_file_path)
+                orders[customer_id]["newsvc_screenshot"] = local_file_path
+                orders[customer_id]["screenshot"] = local_file_path  # mirror for attachments
             except Exception as e:
-                await ctx.send(f"Error sending ping to Telegram: {e}")
-            return
-
-    await ctx.send("This command can only be used in a special order chat.")
-
-
-@discord_bot.command(name="unclaim")
-async def unclaim_ticket(ctx):
-    # Ensure the command is used in a private order channel
-    for telegram_user_id, channel_id in order_mappings.items():
-        if ctx.channel.id == channel_id:
-            # Check if the user issuing the command is the one who claimed the order
-            claimed_channel = discord_bot.get_channel(channel_id)
-            if claimed_channel and claimed_channel.name.startswith(f"order-{ctx.author.name.lower()}"):
-                # Retrieve the order details
-                order = orders.get(telegram_user_id, {})
-                if not order:
-                    await ctx.send("Order details not found.")
-                    return
-
-                # Get the general channel
-                guild = discord_bot.get_guild(GUILD_ID)
-                main_group = guild.get_channel(MAIN_GROUP_ID) if guild else None
-
-                if not main_group:
-                    await ctx.send("General channel not found.")
-                    return
-
-                # Prepare the order summary for the general channel
-                order_summary = f"""
-                **Order Unclaimed**
-
-                ```yaml
-                Service Type:         {order.get('service', 'N/A')}
-                Restaurant:           {order.get('restaurant', 'N/A')}
-                Full Address:         {order.get('pickup_address', order.get('address', 'N/A'))}
-                Phone Number:         {order.get('phone', 'N/A')}
-                Customer Name:        {order.get('name', 'N/A')}
-                Instructions:         {order.get('instructions', 'N/A')}
-                Tip Amount:           {order.get('tip', 'N/A')}
-                ```
-                """
-
-                try:
-                    # Post the order summary back to the main group
-                    general_message = await main_group.send(content=order_summary)
-
-                    # Determine the screenshot path
-                    screenshot_path = order.get("pickup_screenshot") if order.get("service") == "DoorDash Pickup" else order.get("screenshot")
-
-                    # Attach the screenshot if available
-                    screenshot_message = None
-                    if screenshot_path:
-                        with open(screenshot_path, "rb") as screenshot_file:
-                            discord_file = discord.File(screenshot_file, filename="order_screenshot.jpg")
-                            screenshot_message = await main_group.send(content="**Order Screenshot:**", file=discord_file)
-
-                    # Add the "Accept Order" button
-                    view = GeneralOrderView(telegram_user_id, general_message, screenshot_message)
-                    await general_message.edit(view=view)
-
-                    # Notify the admin that the ticket has been unclaimed
-                    await ctx.send("You have unclaimed this ticket. It is now visible to everyone.")
-
-                    # Remove the private channel
-                    try:
-                        await ctx.channel.delete()
-                    except Exception as e:
-                        print(f"Error deleting private channel: {e}")
-
-                    # Clean up mappings
-                    del order_mappings[telegram_user_id]
-
-                except Exception as e:
-                    await ctx.send(f"Error unclaiming the ticket: {e}")
-
+                logger.exception(f"Error saving new service screenshot: {e}")
+                await message.answer("❌ Could not process the image. Try again or send text only.")
                 return
 
-    await ctx.send("This command can only be used in private order channels you have claimed.")
+        orders[customer_id]["step"] = "completed"
+        orders[customer_id]["submitted_to_group"] = True
 
+        await post_order_to_manager_group(customer_id)
 
-from datetime import datetime
+# =========================
+# CUSTOMER FREE TEXT ROUTER (after submission)
+# =========================
+@dp.message(lambda m: m.chat.type == "private")
+async def customer_free_text_router(message: types.Message):
+    customer_id = message.from_user.id
+    step = orders.get(customer_id, {}).get("step")
 
-# Modify paid_orders to include timestamps
-paid_orders = []  # Each entry: {"telegram_user_id": ..., "amount": ..., "date": ..., "order_details": ...}
+    # Let stateful handlers run first
+    active_steps = {
+        # Food steps
+        "food_amount", "food_restaurant", "food_address",
+        "food_phone", "food_name", "food_instructions",
+        "food_tip", "food_screenshot",
+        # New services steps
+        "new_amount", "new_link", "new_details",
+    }
+    if step in active_steps:
+        return
 
+    # If customer has an assigned manager, forward message
+    if customer_id in order_assignments:
+        await forward_customer_message_to_group(customer_id, message)
+        await message.answer("✅ Sent to support.")
+        return
 
-from datetime import datetime, timedelta
+    # If submitted but not accepted yet, still forward to group
+    if orders.get(customer_id, {}).get("submitted_to_group") and customer_id not in order_assignments:
+        await forward_customer_message_to_group(customer_id, message)
+        await message.answer("✅ Sent to the support team. Waiting for acceptance.")
+        return
 
-@discord_bot.command(name="paid")
-async def mark_as_paid(ctx, amount: float = None):
-    for telegram_user_id, discord_channel_id in order_mappings.items():
-        if ctx.channel.id == discord_channel_id:
-            # Retrieve order details
-            order = orders.get(telegram_user_id, {})
-            if not order:
-                await ctx.send("Order not found for this channel.")
-                return
+    return
 
-            # Mark the order as paid
-            paid_orders.append({
-                "telegram_user_id": telegram_user_id,
-                "discord_channel": ctx.channel.id,
-                "amount": amount or 0.0,
-                "order_details": order,
-                "date": datetime.utcnow().strftime("%Y-%m-%d")  # Store the current date
-            })
+# =========================
+# MANAGER GROUP: Accept / Unclaim / Paid + Reply routing
+# =========================
+@dp.callback_query(lambda c: c.data and c.data.startswith("accept:"))
+async def accept_order_callback(callback_query: types.CallbackQuery):
+    manager = callback_query.from_user
+    if callback_query.message.chat.id != MANAGER_GROUP_ID:
+        await callback_query.answer("Wrong chat.", show_alert=True)
+        return
 
-            global total_earnings
-            total_earnings += amount or 0.0
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        await callback_query.answer("You are not allowed to accept orders.", show_alert=True)
+        return
 
-            # Notify the admin
-            await ctx.send(f"Order has been marked as PAID for ${amount:.2f}!")
+    customer_id = int(callback_query.data.split(":", 1)[1])
 
-            # Notify the Telegram client
-            try:
-                await telegram_bot.send_message(
-                    chat_id=telegram_user_id,
-                    text=f"Your order has been marked as PAID for ${amount:.2f}. Thank you!"
-                )
-            except Exception as e:
-                print(f"Error notifying Telegram user: {e}")
+    if customer_id not in orders:
+        await callback_query.answer("Order not found (maybe canceled).", show_alert=True)
+        return
 
-            return
+    # Assign
+    order_assignments[customer_id] = manager.id
+    manager_active_customer[manager.id] = customer_id
 
-    await ctx.send("This command can only be used in order channels.")
+    await bot.send_message(
+        chat_id=customer_id,
+        text="✅ Support joined your chat. You can message here.",
+    )
 
+    await callback_query.message.reply(
+        "✅ Accepted.\nManagers: reply to any customer message in this group to respond.",
+        parse_mode="HTML",
+    )
+    await callback_query.answer("Accepted.")
 
-@discord_bot.command(name="earnings")
-async def show_earnings(ctx, day: str = None):
-    # Default to today's date if no day is provided
+@dp.callback_query(lambda c: c.data and c.data.startswith("unclaim:"))
+async def unclaim_order_callback(callback_query: types.CallbackQuery):
+    manager = callback_query.from_user
+    if callback_query.message.chat.id != MANAGER_GROUP_ID:
+        await callback_query.answer("Wrong chat.", show_alert=True)
+        return
+
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        await callback_query.answer("You are not allowed to unclaim orders.", show_alert=True)
+        return
+
+    customer_id = int(callback_query.data.split(":", 1)[1])
+
+    current_manager = order_assignments.get(customer_id)
+    if not current_manager:
+        await callback_query.answer("Order is not claimed.", show_alert=True)
+        return
+
+    # Strict ownership if you ever disable admin requirement
+    if current_manager != manager.id and not REQUIRE_MANAGER_ADMIN:
+        await callback_query.answer("Only the assigned manager can unclaim.", show_alert=True)
+        return
+
+    order_assignments.pop(customer_id, None)
+    if manager_active_customer.get(manager.id) == customer_id:
+        manager_active_customer.pop(manager.id, None)
+
+    await bot.send_message(chat_id=customer_id, text="ℹ️ Your order is no longer assigned. Waiting for support.")
+    await callback_query.message.reply("🔄 Unclaimed order.", parse_mode="HTML")
+    await callback_query.answer("Unclaimed.")
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("paid_prompt:"))
+async def paid_prompt_callback(callback_query: types.CallbackQuery):
+    manager = callback_query.from_user
+    if callback_query.message.chat.id != MANAGER_GROUP_ID:
+        await callback_query.answer("Wrong chat.", show_alert=True)
+        return
+
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        await callback_query.answer("Not allowed.", show_alert=True)
+        return
+
+    # IMPORTANT: privacy — we do not show customer_id.
+    # Manager must REPLY to the order thread/message and run /paid <amount>
+    await callback_query.answer()
+    await callback_query.message.reply(
+        "💵 To mark paid, reply to the order message (or any customer message) with:\n"
+        "<code>/paid 12.34</code>\n"
+        "(Replace 12.34 with the amount)",
+        parse_mode="HTML",
+    )
+
+@dp.message(Command("paid"))
+async def manager_paid_command(message: types.Message):
+    """
+    Privacy-safe:
+    - Must be used in manager group
+    - Must be a reply to a bot/customer forwarded message so we can map it to customer_id internally
+    - Usage: /paid <amount>
+    """
+    if message.chat.id != MANAGER_GROUP_ID:
+        return
+
+    manager = message.from_user
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        await message.reply("You are not allowed to use this command.")
+        return
+
+    if not message.reply_to_message:
+        await message.reply("Reply to the order/customer message and use: <code>/paid 12.34</code>", parse_mode="HTML")
+        return
+
+    customer_id = group_message_to_customer.get(message.reply_to_message.message_id)
+    if not customer_id:
+        await message.reply("Could not detect the order from this reply. Reply to the bot's order post or customer message.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.reply("Usage: <code>/paid 12.34</code>", parse_mode="HTML")
+        return
+
+    try:
+        amount = float(parts[1])
+    except ValueError:
+        await message.reply("Invalid amount. Usage: <code>/paid 12.34</code>", parse_mode="HTML")
+        return
+
+    order = orders.get(customer_id)
+    if not order:
+        await message.reply("Order not found (maybe canceled).")
+        return
+
+    global total_earnings
+    total_earnings += amount
+
+    paid_orders.append({
+        "customer_id": customer_id,
+        "manager_id": manager.id,
+        "amount": amount,
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "order_details": dict(order),
+    })
+
+    # Group confirmation without any identifiers
+    await message.reply(f"✅ Marked as PAID: <b>${amount:.2f}</b>", parse_mode="HTML")
+
+    # Customer confirmation without manager identity
+    try:
+        await bot.send_message(chat_id=customer_id, text=f"✅ Your order has been marked as PAID for ${amount:.2f}. Thank you!")
+    except Exception:
+        pass
+
+@dp.message(Command("earnings"))
+async def earnings_command(message: types.Message):
+    """
+    Privacy-safe: no customer identifiers in output.
+    """
+    if message.chat.id != MANAGER_GROUP_ID:
+        return
+
+    manager = message.from_user
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        await message.reply("You are not allowed to use this command.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    day = parts[1].strip() if len(parts) > 1 else None
+
     if not day:
         date_to_check = datetime.utcnow().strftime("%Y-%m-%d")
     elif day.lower() == "yesterday":
         date_to_check = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     else:
         try:
-            # Validate provided date
             datetime.strptime(day, "%Y-%m-%d")
             date_to_check = day
         except ValueError:
-            await ctx.send("Invalid date format. Please use YYYY-MM-DD or 'yesterday'.")
+            await message.reply("Invalid date format. Use YYYY-MM-DD or 'yesterday'.")
             return
 
-    # Check if there are any paid orders at all
     if not paid_orders:
-        await ctx.send("No paid orders recorded yet.")
+        await message.reply("No paid orders recorded yet.")
         return
 
-    # Filter paid orders by the specified date
-    daily_orders = [order for order in paid_orders if order["date"] == date_to_check]
-    daily_earnings = sum(order["amount"] for order in daily_orders)
+    daily_orders = [o for o in paid_orders if o["date"] == date_to_check]
+    daily_earnings = sum(o["amount"] for o in daily_orders)
 
-    # Construct the response for the specified date
-    if daily_orders:
-        response = f"**Earnings for {date_to_check}:** ${daily_earnings:.2f}\n\n**Paid Orders:**\n"
-        for idx, order in enumerate(daily_orders, start=1):
-            response += (
-                f"{idx}. Amount: ${order['amount']:.2f} | "
-                f"Service: {order['order_details'].get('service', 'N/A')} | "
-                f"Customer: {order['order_details'].get('name', 'N/A')}\n"
-            )
-    else:
-        # Only include the date-specific message if no orders are found for the date
-        response = f"No paid orders recorded for {date_to_check}."
-
-    # Send the response
-    await ctx.send(response)
-
-
-@discord_bot.event
-async def on_message(message):
-    if message.author == discord_bot.user:
+    if not daily_orders:
+        await message.reply(f"No paid orders recorded for {date_to_check}.")
         return
 
-    # Process commands before forwarding regular messages
-    ctx = await discord_bot.get_context(message)
-    if ctx.valid:
-        await discord_bot.process_commands(message)
+    lines = [f"📈 <b>Earnings for {date_to_check}:</b> <b>${daily_earnings:.2f}</b>\n"]
+    for i, o in enumerate(daily_orders, 1):
+        od = o["order_details"]
+        lines.append(f"{i}. ${o['amount']:.2f} | {html_escape(str(od.get('service','N/A')))}")
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+@dp.message(Command("open"))
+async def open_services(message: types.Message):
+    if message.chat.id != MANAGER_GROUP_ID:
+        return
+    manager = message.from_user
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        await message.reply("You are not allowed to use this command.")
+        return
+    for k in service_availability:
+        service_availability[k] = True
+    await message.reply("✅ All FOOD services are now OPEN.")
+
+@dp.message(Command("close"))
+async def close_services(message: types.Message):
+    if message.chat.id != MANAGER_GROUP_ID:
+        return
+    manager = message.from_user
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        await message.reply("You are not allowed to use this command.")
+        return
+    for k in service_availability:
+        service_availability[k] = False
+    await message.reply("🚫 All FOOD services are now CLOSED.")
+
+@dp.message(Command("cancel"))
+async def cancel_order(message: types.Message):
+    """
+    Customer cancels: no identity shown to group.
+    """
+    customer_id = message.from_user.id
+
+    if customer_id not in orders:
+        await message.reply("You don't have an active order to cancel.")
         return
 
-    # Handle forwarding messages to Telegram
-    for telegram_user_id, discord_channel_id in order_mappings.items():
-        if message.channel.id == discord_channel_id:
-            # Forward text messages
-            if message.content:
-                await telegram_bot.send_message(chat_id=telegram_user_id, text=f"Admin: {message.content}")
-
-            # Forward attachments
-            if message.attachments:
-                for attachment in message.attachments:
-                    try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(attachment.filename)[1]) as temp_file:
-                            temp_file.write(await attachment.read())
-                            temp_file_path = temp_file.name
-
-                        photo = FSInputFile(temp_file_path)
-                        await telegram_bot.send_photo(chat_id=telegram_user_id, photo=photo, caption="Admin sent a photo.")
-                    except Exception as e:
-                        print(f"Error forwarding attachment to Telegram: {e}")
-                    finally:
-                        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-                            os.unlink(temp_file_path)
-
-            break  # Exit loop after handling the relevant channel
-
-
-class GeneralOrderView(View):
-    def __init__(self, user_id, general_message, screenshot_message=None):
-        super().__init__(timeout=None)
-        self.user_id = user_id
-        self.general_message = general_message  # Reference to the general message with the order
-        self.screenshot_message = screenshot_message  # Reference to the screenshot message (if any)
-
-    @discord.ui.button(label="Accept Order", style=discord.ButtonStyle.primary, custom_id="accept_order_general")
-    async def accept_order(self, interaction: discord.Interaction, button: discord.ui.Button):
-        admin = interaction.user
-        guild = interaction.guild
-
-        if not admin.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can accept orders.", ephemeral=True)
-            return
-
-        # Create a private channel for the order
-        channel_name = f"order-{admin.name.lower()}"
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            admin: discord.PermissionOverwrite(read_messages=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True),
-        }
-        private_channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
-
-        # Map the Telegram user ID to the new Discord channel
-        order_mappings[self.user_id] = private_channel.id
-
-        # Dynamically construct the order summary
-        order = orders.get(self.user_id, {})
-        fields = []
-
-        if order.get("service"):
-            fields.append(f"Service Type:         {order.get('service')}")
-        if order.get("restaurant"):
-            fields.append(f"Restaurant:           {order.get('restaurant')}")
-        if order.get("pickup_address") and order["service"] == "DoorDash Pickup":
-            fields.append(f"Full Address:         {order.get('pickup_address')}")
-        if order.get("address") and order["service"] != "DoorDash Pickup":
-            fields.append(f"Full Address:         {order.get('address')}")
-        if order.get("phone"):
-            fields.append(f"Phone Number:         {order.get('phone')}")
-        if order.get("name"):
-            fields.append(f"Customer Name:        {order.get('name')}")
-        if order.get("instructions"):
-            fields.append(f"Instructions:         {order.get('instructions')}")
-        if order.get("tip"):
-            fields.append(f"Tip Amount:           {order.get('tip')}")
-
-        # Join the fields into a formatted string
-        order_summary = "\n".join(fields)
-
-        # Send the summary to the private channel
-        await private_channel.send(f"**Order Accepted by {admin.mention}**\n```yaml\n{order_summary}\n```")
-
-        # Send the order screenshot if available
-        screenshot_path = order.get("pickup_screenshot") if order.get("service") == "DoorDash Pickup" else order.get("screenshot")
-        if screenshot_path:
-            try:
-                with open(screenshot_path, "rb") as screenshot_file:
-                    discord_file = discord.File(screenshot_file, filename="pickup_order_screenshot.jpg")
-                    await private_channel.send(content="**Order Screenshot:**", file=discord_file)
-            except Exception as e:
-                print(f"Error sending pickup screenshot to private Discord channel: {e}")
-
-        # Notify the Telegram user
-        await telegram_bot.send_message(
-            chat_id=self.user_id,
-            text="An admin has accepted your order! You can now communicate with the admin."
+    if customer_id in order_assignments:
+        await bot.send_message(
+            chat_id=MANAGER_GROUP_ID,
+            text="🚫 Customer canceled the order.",
+            parse_mode="HTML",
         )
+        manager_id = order_assignments.pop(customer_id, None)
+        if manager_id and manager_active_customer.get(manager_id) == customer_id:
+            manager_active_customer.pop(manager_id, None)
 
-        # Delete the original message and screenshot from the general group
-        if self.general_message:
-            try:
-                await self.general_message.delete()
-            except Exception as e:
-                print(f"Error deleting general message: {e}")
-        if self.screenshot_message:
-            try:
-                await self.screenshot_message.delete()
-            except Exception as e:
-                print(f"Error deleting screenshot message: {e}")
+    orders.pop(customer_id, None)
+    await message.reply("Your order has been successfully canceled.")
 
-        # Acknowledge the interaction
-        await interaction.response.edit_message(content="Order accepted and private channel created!", view=None)
-        await interaction.message.delete()
+@dp.message(lambda m: m.chat.id == MANAGER_GROUP_ID)
+async def manager_group_router(message: types.Message):
+    """
+    Managers reply in the group to bot-posted/forwarded messages.
+    Mapping is INTERNAL only; no parsing from visible text.
+    """
+    if not message.reply_to_message:
+        return
 
+    manager = message.from_user
+    if not await is_manager_allowed(manager, MANAGER_GROUP_ID):
+        return
 
-@discord_bot.event
-async def on_ready():
-    print(f"Discord bot logged in as {discord_bot.user}")
+    customer_id = group_message_to_customer.get(message.reply_to_message.message_id)
+    if not customer_id:
+        return
 
+    await forward_manager_reply_to_customer(customer_id, message)
+    manager_active_customer[manager.id] = customer_id
 
-# Main Function
+# =========================
+# MAIN
+# =========================
 async def main():
-    telegram_task = telegram_dp.start_polling(telegram_bot, skip_updates=True)
-    discord_task = discord_bot.start(DISCORD_TOKEN)
-    await asyncio.gather(telegram_task, discord_task)
-
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
